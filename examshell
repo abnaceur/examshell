@@ -3,5 +3,7 @@
 VENV_ROOT="/usr/share/examshell/venv"
 
 source $VENV_ROOT/bin/activate
-examshell-cli.py
+
+python3.8 /usr/share/examshell/venv/lib/python3.8/site-packages/examshell-3.0-py3.8.egg/EGG-INFO/scripts/examshell-cli.pycode examshell
+
 deactivate
