@@ -1,0 +1,226 @@
+name: Autonomous Codex Phase Executor
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      phase_id:
+        description: EXAM-PHASE-XX to execute
+        required: true
+        type: string
+      issue_number:
+        description: Owning issue number
+        required: false
+        type: string
+      pr_number:
+        description: Existing PR number for a correction
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exam-codex-${{ github.repository }}-${{ github.event.issue.number || inputs.phase_id }}
+  cancel-in-progress: false
+
+jobs:
+  execute:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.comment.body, '@codex') &&
+       (github.actor == '1122-exam-delivery[bot]' ||
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Require Codex workspace credential
+        env:
+          CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
+        run: test -n "$CODEX_ACCESS_TOKEN"
+
+      - name: Create delivery GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.EXAM_DELIVERY_APP_ID }}
+          private-key: ${{ secrets.EXAM_DELIVERY_APP_PRIVATE_KEY }}
+          owner: abnaceur
+          repositories: 1122-exam-delivery,p2p-intra,examshell,1122-assefa-cr-pk,1122-exam
+          permission-actions: read
+          permission-checks: read
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Check out owning repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          path: work
+
+      - name: Check out delivery control plane
+        uses: actions/checkout@v4
+        with:
+          repository: abnaceur/1122-exam-delivery
+          token: ${{ steps.app-token.outputs.token }}
+          path: delivery
+
+      - name: Resolve phase context
+        id: context
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INPUT_PHASE_ID: ${{ inputs.phase_id }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          const candidates = [process.env.INPUT_PHASE_ID, event.comment?.body, event.issue?.title, event.issue?.body];
+          const phase = candidates.map(String).map((value) => value.match(/EXAM-PHASE-(?:0[0-9]|1[0-9]|2[0-7])/i)?.[0]).find(Boolean)?.toUpperCase();
+          if (!phase) throw new Error('No EXAM-PHASE-XX identifier found');
+          const issueNumber = process.env.INPUT_ISSUE_NUMBER || event.issue?.number || '';
+          const prNumber = process.env.INPUT_PR_NUMBER || (event.issue?.pull_request ? event.issue.number : '');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `phase_id=${phase}\nissue_number=${issueNumber}\npr_number=${prNumber}\n`);
+          NODE
+
+      - name: Check out P2P Intra evidence source
+        if: steps.context.outputs.phase_id == 'EXAM-PHASE-00'
+        uses: actions/checkout@v4
+        with:
+          repository: abnaceur/p2p-intra
+          token: ${{ steps.app-token.outputs.token }}
+          path: sources/p2p-intra
+
+      - name: Check out Exam Shell evidence source
+        if: steps.context.outputs.phase_id == 'EXAM-PHASE-00'
+        uses: actions/checkout@v4
+        with:
+          repository: abnaceur/examshell
+          token: ${{ steps.app-token.outputs.token }}
+          path: sources/examshell
+
+      - name: Check out correction-pack evidence source
+        if: steps.context.outputs.phase_id == 'EXAM-PHASE-00'
+        uses: actions/checkout@v4
+        with:
+          repository: abnaceur/1122-assefa-cr-pk
+          token: ${{ steps.app-token.outputs.token }}
+          path: sources/1122-assefa-cr-pk
+
+      - name: Select implementation branch
+        id: branch
+        working-directory: work
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PHASE_ID: ${{ steps.context.outputs.phase_id }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+        run: |
+          if [ -n "$PR_NUMBER" ]; then
+            branch=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.ref)
+            git fetch origin "$branch"
+            git checkout -B "$branch" "origin/$branch"
+          else
+            branch="codex/$(printf '%s' "$PHASE_ID" | tr '[:upper:]' '[:lower:]')"
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              git fetch origin "$branch"
+              git checkout -B "$branch" "origin/$branch"
+            else
+              git checkout -b "$branch"
+            fi
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Install and authenticate Codex
+        env:
+          CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
+        run: |
+          npm install --global @openai/codex
+          printenv CODEX_ACCESS_TOKEN | codex login --with-access-token
+
+      - name: Build trusted execution prompt
+        env:
+          PHASE_ID: ${{ steps.context.outputs.phase_id }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const phase = process.env.PHASE_ID;
+          const prompt = `Execute ${phase} autonomously in the current repository.
+
+          Read ./AGENTS.md when present, plus ../delivery/AGENTS.md, ../delivery/features/exam-platform/specification.md, ../delivery/features/exam-platform/delivery-plan.yml, ../delivery/docs/orchestration.md, and ../delivery/features/exam-platform/phases/${phase}.json.
+
+          Modify only the current repository. Do not modify the evidence checkouts under ../sources or the control checkout under ../delivery. For EXAM-PHASE-00, inspect every repository under ../sources and record the exact inspected commit SHAs and source paths. Never substitute NOT_INSPECTED for required repository inspection. For an unavailable live benchmark dependency, add a repeatable harness and record NOT_MEASURED; never invent measurements.
+
+          Run all repository-required tests and checks. Write ./.exam-delivery/${phase}-acceptance.json matching ../delivery/schemas/acceptance-evidence.schema.json and every exact criterion in the phase definition. Do not commit, push, merge, use production credentials, deploy production infrastructure, or perform destructive operations; the trusted workflow publishes validated changes.`;
+          fs.writeFileSync('codex-phase-prompt.md', prompt);
+          NODE
+
+      - name: Execute Codex
+        working-directory: work
+        run: codex exec --ephemeral --sandbox workspace-write --add-dir ../delivery --add-dir ../sources --output-last-message ../codex-final.txt "$(cat ../codex-phase-prompt.md)"
+
+      - name: Validate exact phase evidence
+        env:
+          PHASE_ID: ${{ steps.context.outputs.phase_id }}
+        run: |
+          node delivery/bin/validate-phase-output.mjs \
+            --phase "delivery/features/exam-platform/phases/$PHASE_ID.json" \
+            --evidence "work/.exam-delivery/$PHASE_ID-acceptance.json" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Commit and push validated changes
+        working-directory: work
+        env:
+          PHASE_ID: ${{ steps.context.outputs.phase_id }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          git config user.name "1122-exam-delivery[bot]"
+          git config user.email "1122-exam-delivery[bot]@users.noreply.github.com"
+          git add --all
+          if git diff --cached --quiet; then
+            echo "Codex produced no publishable changes" >&2
+            exit 1
+          fi
+          git commit -m "Implement $PHASE_ID"
+          git push --set-upstream origin "$BRANCH"
+
+      - name: Open or locate pull request
+        id: pr
+        working-directory: work
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PHASE_ID: ${{ steps.context.outputs.phase_id }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          INPUT_PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+        run: |
+          pr_number="$INPUT_PR_NUMBER"
+          if [ -z "$pr_number" ]; then
+            pr_number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          fi
+          if [ -z "$pr_number" ]; then
+            body="Implements $PHASE_ID through the autonomous executor."
+            if [ -n "$ISSUE_NUMBER" ]; then body="$body\n\nCloses #$ISSUE_NUMBER"; fi
+            url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" --title "$PHASE_ID — autonomous implementation" --body "$body")
+            pr_number=$(gh pr view "$url" --json number --jq .number)
+          fi
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Forward PR state to delivery control plane
+        if: github.repository != 'abnaceur/1122-exam-delivery'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PHASE_ID: ${{ steps.context.outputs.phase_id }}
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+          jq -n --arg delivery_id "$GITHUB_REPOSITORY:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:pull_request" \
+            --arg repo "$GITHUB_REPOSITORY" --argjson pr "$pr" \
+            '{event_type:"exam-delivery-event",client_payload:{delivery_id:$delivery_id,event_name:"pull_request",payload:{action:"synchronize",repository:{full_name:$repo},pull_request:$pr}}}' \
+            | gh api repos/abnaceur/1122-exam-delivery/dispatches --method POST --input -
