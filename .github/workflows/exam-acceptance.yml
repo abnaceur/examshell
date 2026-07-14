@@ -1,0 +1,50 @@
+name: Exam Phase Acceptance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Detect exam phase pull request
+        id: phase
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          phase=$(printf '%s\n%s\n' "$TITLE" "$BRANCH" | grep -Eio 'EXAM-PHASE-(0[0-9]|1[0-9]|2[0-7])' | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          echo "phase_id=$phase" >> "$GITHUB_OUTPUT"
+      - name: Create read token
+        if: steps.phase.outputs.phase_id != ''
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.EXAM_DELIVERY_APP_ID }}
+          private-key: ${{ secrets.EXAM_DELIVERY_APP_PRIVATE_KEY }}
+          owner: abnaceur
+          repositories: 1122-exam-delivery
+          permission-contents: read
+      - uses: actions/checkout@v4
+        if: steps.phase.outputs.phase_id != ''
+        with:
+          path: work
+      - uses: actions/checkout@v4
+        if: steps.phase.outputs.phase_id != ''
+        with:
+          repository: abnaceur/1122-exam-delivery
+          token: ${{ steps.app-token.outputs.token }}
+          path: delivery
+      - name: Validate phase evidence when this is a phase PR
+        if: steps.phase.outputs.phase_id != ''
+        env:
+          PHASE_ID: ${{ steps.phase.outputs.phase_id }}
+        run: |
+          validator=delivery/bin/validate-phase-output.mjs
+          if [ -f "work/bin/validate-phase-output.mjs" ]; then validator=work/bin/validate-phase-output.mjs; fi
+          node "$validator" --phase "delivery/features/exam-platform/phases/$PHASE_ID.json" --evidence "work/.exam-delivery/$PHASE_ID-acceptance.json" --repository "$GITHUB_REPOSITORY"

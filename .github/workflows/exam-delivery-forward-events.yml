@@ -1,0 +1,42 @@
+name: Exam Delivery Event Forwarder
+
+on:
+  issues:
+    types: [opened, closed, reopened]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  workflow_run:
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  forward:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.name != 'Exam Delivery Event Forwarder'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create delivery GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.EXAM_DELIVERY_APP_ID }}
+          private-key: ${{ secrets.EXAM_DELIVERY_APP_PRIVATE_KEY }}
+          owner: abnaceur
+          repositories: 1122-exam-delivery
+          permission-contents: write
+      - name: Forward the original event
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          jq -n --arg delivery_id "$GITHUB_REPOSITORY:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:$GITHUB_EVENT_NAME" \
+            --arg event_name "$GITHUB_EVENT_NAME" --slurpfile payload "$GITHUB_EVENT_PATH" \
+            '{event_type:"exam-delivery-event",client_payload:{delivery_id:$delivery_id,event_name:$event_name,payload:$payload[0]}}' \
+            | gh api repos/abnaceur/1122-exam-delivery/dispatches --method POST --input -
